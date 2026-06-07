@@ -56,6 +56,152 @@ static uint32_t server_n_outputs_max(const common_params & params) {
     return std::max<uint32_t>(1, std::min<uint64_t>(n_batch, n_outputs));
 }
 
+// Checkpoint trailer appended to the slot snapshot file (after llama state data).
+//
+// Format:
+//   Magic:       "LLCK" (4 bytes)
+//   Version:     uint32_t (currently 2)
+//   Count:       uint32_t (number of checkpoints)
+//   For each checkpoint:
+//     pos_min:        int32_t
+//     pos_max:        int32_t
+//     n_tokens:       int64_t
+//     data_tgt_size:  uint64_t
+//     data_tgt:       [data_tgt_size bytes]
+//     data_dft_size:  uint64_t
+//     data_dft:       [data_dft_size bytes]
+//
+// llama_state_seq_load_file reads structured fields and ignores trailing data,
+// so this trailer does not interfere with normal slot restore.
+
+static const char     SLOT_CKPT_MAGIC[4] = {'L', 'L', 'C', 'K'};
+static const uint32_t SLOT_CKPT_VERSION  = 2;
+
+// Write checkpoint data at the given offset in the snapshot file.
+// Typically called after llama_state_seq_save_file with offset = nwrite.
+static bool slot_save_checkpoints_inline(const std::string & filepath, size_t offset, const std::list<common_prompt_checkpoint> & checkpoints) {
+    // "r+b" so we can seek to offset and write, preserving what is before it.
+    // llama_state_seq_save_file opens with "wb" (truncates), so the file is
+    // exactly `offset` bytes when we get here.
+    FILE * f = fopen(filepath.c_str(), "r+b");
+    if (!f) {
+        SRV_ERR("failed to open snapshot for checkpoint append: %s\n", filepath.c_str());
+        return false;
+    }
+
+    bool ok = false;
+    auto write_raw = [&](const void * ptr, size_t size) -> bool {
+        return fwrite(ptr, 1, size, f) == size;
+    };
+
+    fseek((FILE *)f, (long)offset, SEEK_SET);
+
+    uint32_t count = (uint32_t) checkpoints.size();
+    if (!write_raw(SLOT_CKPT_MAGIC, 4)) goto done;
+    if (!write_raw(&SLOT_CKPT_VERSION, sizeof(SLOT_CKPT_VERSION))) goto done;
+    if (!write_raw(&count, sizeof(count))) goto done;
+
+    for (const auto & ckpt : checkpoints) {
+        uint64_t data_tgt_size = (uint64_t) ckpt.data_tgt.size();
+        uint64_t data_dft_size = (uint64_t) ckpt.data_dft.size();
+        if (!write_raw(&ckpt.pos_min, sizeof(ckpt.pos_min))) goto done;
+        if (!write_raw(&ckpt.pos_max, sizeof(ckpt.pos_max))) goto done;
+        if (!write_raw(&ckpt.n_tokens, sizeof(ckpt.n_tokens))) goto done;
+        if (!write_raw(&data_tgt_size, sizeof(data_tgt_size))) goto done;
+        if (data_tgt_size > 0 && !write_raw(ckpt.data_tgt.data(), (size_t) data_tgt_size)) goto done;
+        if (!write_raw(&data_dft_size, sizeof(data_dft_size))) goto done;
+        if (data_dft_size > 0 && !write_raw(ckpt.data_dft.data(), (size_t) data_dft_size)) goto done;
+    }
+    ok = true;
+
+done:
+    fclose(f);
+    if (!ok) {
+        SRV_ERR("failed to write checkpoint trailer: %s\n", filepath.c_str());
+    }
+    return ok;
+}
+
+// Read checkpoint data from the snapshot file starting at the given offset.
+// Typically called after llama_state_seq_load_file with offset = nread.
+// If no checkpoint trailer is found (old file), keeps existing checkpoints unchanged.
+static bool slot_load_checkpoints_inline(const std::string & filepath, size_t offset, std::list<common_prompt_checkpoint> & checkpoints) {
+    FILE * f = fopen(filepath.c_str(), "rb");
+    if (!f) return true;
+
+    bool ok = false;
+    auto read_raw = [&](void * ptr, size_t size) -> bool {
+        return fread(ptr, 1, size, f) == size;
+    };
+
+    fseek((FILE *)f, (long)offset, SEEK_SET);
+
+    // Check for checkpoint trailer magic.
+    // Old snapshots without checkpoints simply end at offset.
+    char magic[4] = {};
+    if (fread(magic, 1, 4, f) != 4 || memcmp(magic, SLOT_CKPT_MAGIC, 4) != 0) {
+        // No checkpoint trailer — backward compatible.
+        SRV_DBG("no checkpoint trailer at offset %zu in %s (backward compatible)\n", offset, filepath.c_str());
+        ok = true;
+        goto done;
+    }
+
+    {
+        uint32_t version = 0;
+        uint32_t count   = 0;
+
+        if (!read_raw(&version, sizeof(version))) goto done;
+        if (version != SLOT_CKPT_VERSION)        goto done;
+        if (!read_raw(&count, sizeof(count)))     goto done;
+
+        checkpoints.clear();
+        for (uint32_t i = 0; i < count; i++) {
+            common_prompt_checkpoint ckpt {};
+            uint64_t data_tgt_size = 0;
+            uint64_t data_dft_size = 0;
+            if (!read_raw(&ckpt.pos_min,  sizeof(ckpt.pos_min)))  goto done;
+            if (!read_raw(&ckpt.pos_max,  sizeof(ckpt.pos_max)))  goto done;
+            if (!read_raw(&ckpt.n_tokens, sizeof(ckpt.n_tokens))) goto done;
+            if (!read_raw(&data_tgt_size, sizeof(data_tgt_size))) goto done;
+            ckpt.data_tgt.resize((size_t) data_tgt_size);
+            if (data_tgt_size > 0 && !read_raw(ckpt.data_tgt.data(), (size_t) data_tgt_size)) goto done;
+            if (!read_raw(&data_dft_size, sizeof(data_dft_size))) goto done;
+            ckpt.data_dft.resize((size_t) data_dft_size);
+            if (data_dft_size > 0 && !read_raw(ckpt.data_dft.data(), (size_t) data_dft_size)) goto done;
+            checkpoints.push_back(std::move(ckpt));
+        }
+    }
+    ok = true;
+
+done:
+    fclose(f);
+    if (!ok) {
+        SRV_WRN("failed to read checkpoint trailer from %s at offset %zu (ignoring)\n", filepath.c_str(), offset);
+    }
+    return ok;
+}
+
+static void common_prompt_checkpoint_update(common_prompt_checkpoint & ckpt, llama_context * ctx, int id, int64_t n_tokens, bool on_device, llama_pos pos_min = -1, llama_pos pos_max = -1) {
+    if (pos_min == -1) {
+        pos_min = llama_memory_seq_pos_min(llama_get_memory(ctx), id);
+    }
+    if (pos_max == -1) {
+        pos_max = llama_memory_seq_pos_max(llama_get_memory(ctx), id);
+    }
+
+    ckpt.pos_min  = pos_min;
+    ckpt.pos_max  = pos_max;
+    ckpt.n_tokens = n_tokens;
+
+    auto flags = LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY;
+    if (on_device) {
+        flags |= LLAMA_STATE_SEQ_FLAGS_ON_DEVICE;
+    }
+
+    ckpt.update_tgt(ctx, id, flags);
+    ckpt.update_dft(ctx, id, flags);
+}
+
 // state diagram: https://github.com/ggml-org/llama.cpp/pull/9283
 enum slot_state {
     SLOT_STATE_IDLE,
@@ -2247,6 +2393,10 @@ private:
                     const llama_tokens & tokens = slot->prompt.tokens.get_tokens();
                     const size_t nwrite = llama_state_seq_save_file(ctx_tgt, filepath.c_str(), slot->id, tokens.data(), token_count);
 
+                    // Append the in-RAM rollback checkpoints to the snapshot file so that
+                    // SLOT_RESTORE can recover them after the slot has been overwritten.
+                    slot_save_checkpoints_inline(filepath, nwrite, slot->prompt.checkpoints);
+
                     const int64_t t_end = ggml_time_us();
                     const double t_save_ms = (t_end - t_start) / 1000.0;
 
@@ -2293,6 +2443,11 @@ private:
                     tokens.resize(token_count);
                     slot->prompt.tokens.clear();
                     slot->prompt.tokens.insert(tokens);
+
+                    // Restore the in-RAM rollback checkpoints from the snapshot file trailer.
+                    // This allows proper rollback to an earlier prompt boundary after restore.
+                    // If no trailer exists (old snapshot), keep current checkpoints for backward compat.
+                    slot_load_checkpoints_inline(filepath, nread, slot->prompt.checkpoints);
 
                     const int64_t t_end = ggml_time_us();
                     const double t_restore_ms = (t_end - t_start) / 1000.0;
