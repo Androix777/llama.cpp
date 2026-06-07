@@ -56,6 +56,7 @@ static uint32_t server_n_outputs_max(const common_params & params) {
     return std::max<uint32_t>(1, std::min<uint64_t>(n_batch, n_outputs));
 }
 
+
 // Checkpoint trailer appended to the slot snapshot file (after llama state data).
 //
 // Format:
